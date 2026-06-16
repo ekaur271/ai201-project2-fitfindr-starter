@@ -18,7 +18,58 @@ Usage (once implemented):
     print(result["error"])   # None on success
 """
 
+import re
+
 from tools import search_listings, suggest_outfit, create_fit_card
+
+
+# ── query parsing ───────────────────────────────────────────────────────────
+
+SIZE_WORDS = ["xxs", "xs", "small", "medium", "large", "xl", "xxl", "xxxl"]
+SIZE_ABBREV = {"small": "S", "medium": "M", "large": "L"}
+
+
+def parse_query(query):
+    """Pull a description, size, and max_price out of a plain-text query."""
+    text = query.lower()
+
+    # find a price, e.g. "under $30" or just "$30"
+    max_price = None
+    m = re.search(r"(?:under|below|less than|max|<=?)\s*\$?\s*(\d+(?:\.\d+)?)", text)
+    if not m:
+        m = re.search(r"\$\s*(\d+(?:\.\d+)?)", text)
+    if m:
+        max_price = float(m.group(1))
+
+    # find a size: "size M" first, otherwise a size word on its own
+    size = None
+    sm = re.search(r"size\s+([a-z0-9]+)", text)
+    if sm:
+        token = sm.group(1)
+        size = SIZE_ABBREV.get(token, token.upper())
+    else:
+        tokens = re.findall(r"[a-z0-9]+", text)
+        for word in SIZE_WORDS:
+            if word in tokens:
+                size = SIZE_ABBREV.get(word, word.upper())
+                break
+        else:
+            for tok in tokens:
+                if tok in {"xs", "xl", "xxl"} or (len(tok) == 1 and tok in "sml"):
+                    size = tok.upper()
+                    break
+
+    # whatever's left after taking out the price/size phrases is the description
+    description = query
+    description = re.sub(
+        r"(?:under|below|less than|max|<=?)\s*\$?\s*\d+(?:\.\d+)?", " ", description,
+        flags=re.IGNORECASE,
+    )
+    description = re.sub(r"\$\s*\d+(?:\.\d+)?", " ", description)
+    description = re.sub(r"size\s+[a-z0-9]+", " ", description, flags=re.IGNORECASE)
+    description = re.sub(r"\s+", " ", description).strip()
+
+    return {"description": description, "size": size, "max_price": max_price}
 
 
 # ── session state ─────────────────────────────────────────────────────────────
@@ -92,9 +143,42 @@ def run_agent(query: str, wardrobe: dict) -> dict:
     Before writing code, complete the Planning Loop and State Management sections
     of planning.md — your implementation should match what you described there.
     """
-    # TODO: implement the planning loop
     session = _new_session(query, wardrobe)
-    session["error"] = "Planning loop not yet implemented."
+
+    # parse the query into description / size / max_price
+    session["parsed"] = parse_query(query)
+    parsed = session["parsed"]
+
+    # search the listings with those params
+    session["search_results"] = search_listings(
+        description=parsed["description"],
+        size=parsed["size"],
+        max_price=parsed["max_price"],
+    )
+
+    # if nothing came back, stop here and tell the user why (don't run the other tools)
+    if not session["search_results"]:
+        bits = [f"'{parsed['description']}'"]
+        if parsed["size"]:
+            bits.append(f"size {parsed['size']}")
+        if parsed["max_price"] is not None:
+            bits.append(f"under ${parsed['max_price']:.0f}")
+        session["error"] = (
+            f"No listings matched {', '.join(bits)}. "
+            "Try raising your price limit, dropping the size filter, "
+            "or using broader keywords."
+        )
+        return session
+
+    # take the top match and style it, then caption the outfit
+    session["selected_item"] = session["search_results"][0]
+    session["outfit_suggestion"] = suggest_outfit(
+        session["selected_item"], session["wardrobe"]
+    )
+    session["fit_card"] = create_fit_card(
+        session["outfit_suggestion"], session["selected_item"]
+    )
+
     return session
 
 
